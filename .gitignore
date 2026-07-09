@@ -1,0 +1,4 @@
+output/ 
+logs/ 
+__pycache__/ 
+product_urls.txt 
