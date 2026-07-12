@@ -1,8 +1,19 @@
 """
 crawler.py
 ----------
-Discovers all product URLs from a Shopify store using the built-in
-/products.json API endpoint - no HTML parsing, no pagination guesswork.
+Discovers all products from a Shopify store using the built-in
+/products.json API endpoint.
+
+Returns full product data including title and all image URLs directly
+from the API — no browser visits needed, no rate limiting, no blocking.
+
+Every Shopify store exposes:
+  GET /products.json?limit=250&page=N
+
+Each product in the response contains:
+  - title        : product name (used as folder name)
+  - handle       : URL slug
+  - images       : list of image objects with src URLs
 """
 
 import time
@@ -25,13 +36,44 @@ _session.headers.update({
 
 
 def discover_product_urls(start_url: str = config.START_URL) -> list[str]:
+    """
+    Return all product page URLs from a Shopify store via the JSON API.
+    Used for compatibility — main pipeline uses discover_all_products().
+
+    Args:
+        start_url: Any URL on the Shopify store.
+
+    Returns:
+        Deduplicated list of absolute product-page URLs.
+    """
+    products = discover_all_products(start_url)
+    parsed = urlparse(start_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    return [f"{base}/products/{p['handle']}" for p in products if p.get("handle")]
+
+
+def discover_all_products(start_url: str = config.START_URL) -> list[dict]:
+    """
+    Return all products from a Shopify store via the JSON API.
+
+    Each returned dict contains:
+      - title  : product name
+      - handle : URL slug
+      - images : list of full-resolution image URLs (query strings stripped)
+
+    Args:
+        start_url: Any URL on the Shopify store (we extract the base domain).
+
+    Returns:
+        List of product dicts with title and image URLs ready for download.
+    """
     parsed = urlparse(start_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
     api_base = f"{base}/products.json"
 
     logger.info("Crawling Shopify JSON API: %s", api_base)
 
-    product_urls: list[str] = []
+    products_data: list[dict] = []
     seen: set[str] = set()
     page = 1
 
@@ -50,18 +92,34 @@ def discover_product_urls(start_url: str = config.START_URL) -> list[str]:
         products = data.get("products", [])
 
         if not products:
-            logger.info("Page %d returned 0 products - crawl complete.", page)
+            logger.info("Page %d returned 0 products — crawl complete.", page)
             break
 
         for product in products:
             handle = product.get("handle", "")
-            if handle and handle not in seen:
-                seen.add(handle)
-                product_urls.append(f"{base}/products/{handle}")
+            if not handle or handle in seen:
+                continue
+            seen.add(handle)
+
+            # Extract full-resolution image URLs by stripping Shopify's
+            # sizing query strings (e.g. ?v=123&width=533).
+            image_urls = []
+            for img in product.get("images", []):
+                src = img.get("src", "")
+                if src:
+                    # Strip query string to get full resolution.
+                    clean_src = src.split("?")[0]
+                    image_urls.append(clean_src)
+
+            products_data.append({
+                "title":  product.get("title", handle),
+                "handle": handle,
+                "images": image_urls,
+            })
 
         logger.info(
-            "Page %d - %d products (total so far: %d)",
-            page, len(products), len(product_urls),
+            "Page %d — %d products (total so far: %d)",
+            page, len(products), len(products_data),
         )
 
         if len(products) < 250:
@@ -71,5 +129,5 @@ def discover_product_urls(start_url: str = config.START_URL) -> list[str]:
         page += 1
         time.sleep(config.CRAWL_DELAY_SECONDS)
 
-    logger.info("Crawl complete. Total product URLs: %d", len(product_urls))
-    return product_urls
+    logger.info("Crawl complete. Total products: %d", len(products_data))
+    return products_data
