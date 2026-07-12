@@ -7,18 +7,24 @@ Run with:
     python app.py
 
 Change START_URL (and any other setting) in config.py before running.
+
+Pipeline (Shopify API mode - fast, no blocking):
+  1. Fetch all products + image URLs directly from /products.json API
+  2. Download and convert images into per-product folders
+  3. Write a CSV summary report
+
+No browser visits to individual product pages — everything comes from
+the Shopify JSON API, which is fast, reliable and never rate-limits images.
 """
 
 import csv
 import time
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
 from tqdm import tqdm
 
 import config
-from crawler import discover_product_urls
-from scraper import scrape_page
+from crawler import discover_all_products
 from downloader import download_images
 from utils import get_logger, sanitize_folder_name, ensure_directory
 
@@ -32,10 +38,9 @@ logger = get_logger(__name__)
 def main() -> None:
     """
     Full pipeline:
-    1. Crawl the site to collect product URLs.
-    2. Visit each product page to extract title + image URLs.
-    3. Download and convert images into per-product folders.
-    4. Write a CSV summary report.
+    1. Fetch all product data (title + images) from Shopify JSON API.
+    2. Download and convert images into per-product folders.
+    3. Write a CSV summary report.
     """
     start_time = time.time()
     output_root = Path(config.OUTPUT_FOLDER)
@@ -51,65 +56,50 @@ def main() -> None:
     logger.info("=" * 60)
 
     # ------------------------------------------------------------------
-    # Step 1 — Discover product URLs
+    # Step 1 — Fetch all products + image URLs from Shopify API
     # ------------------------------------------------------------------
-    print("\n🔍  Discovering product pages …")
-    product_urls = discover_product_urls(config.START_URL)
+    print("\n🔍  Fetching product data from Shopify API …")
+    products = discover_all_products(config.START_URL)
 
-    if not product_urls:
-        logger.error("No product URLs found. Check START_URL and crawler heuristics.")
+    if not products:
+        logger.error("No products found. Check START_URL in config.py.")
         return
 
-    print(f"✅  Found {len(product_urls)} product pages.\n")
+    total_api_images = sum(len(p["images"]) for p in products)
+    print(f"✅  Found {len(products)} products with {total_api_images} images total.\n")
 
     # ------------------------------------------------------------------
-    # Steps 2–6 — Scrape, download, convert
+    # Steps 2 — Download and convert images
     # ------------------------------------------------------------------
     report_rows: list[dict] = []
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=config.HEADLESS)
-        page = browser.new_page()
-        page.set_extra_http_headers({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        })
+    progress = tqdm(
+        products,
+        desc="Products processed",
+        unit="product",
+        ncols=72,
+        bar_format="{desc}: {bar} {n_fmt}/{total_fmt}",
+    )
 
-        progress = tqdm(
-            product_urls,
-            desc="Books processed",
-            unit="page",
-            ncols=72,
-            bar_format="{desc}: {bar} {n_fmt}/{total_fmt}",
-        )
+    for product in progress:
+        title       = product["title"]
+        image_urls  = product["images"]
+        safe_name   = sanitize_folder_name(title)
+        folder      = output_root / safe_name
 
-        for url in progress:
-            # Scrape title + image URLs.
-            title, image_urls = scrape_page(page, url)
-            safe_name = sanitize_folder_name(title)
-            folder = output_root / safe_name
+        progress.set_postfix_str(safe_name[:30], refresh=True)
 
-            progress.set_postfix_str(safe_name[:30], refresh=True)
+        if not image_urls:
+            logger.info("No images in API data for: %s", title)
+            report_rows.append({"Product Name": title, "Images Downloaded": 0})
+            continue
 
-            if not image_urls:
-                logger.info("No images found on: %s", url)
-                report_rows.append({"Book Name": title, "Images Downloaded": 0})
-                continue
-
-            # Download + convert images.
-            count = download_images(image_urls, folder)
-            report_rows.append({"Book Name": title, "Images Downloaded": count})
-            logger.info("'%s' — %d image(s) saved", title, count)
-
-            time.sleep(config.CRAWL_DELAY_SECONDS)
-
-        browser.close()
+        count = download_images(image_urls, folder)
+        report_rows.append({"Product Name": title, "Images Downloaded": count})
+        logger.info("'%s' — %d image(s) saved", title, count)
 
     # ------------------------------------------------------------------
-    # Step 9 — CSV report
+    # Step 3 — CSV report
     # ------------------------------------------------------------------
     report_path = output_root / config.REPORT_FILENAME
     _write_csv_report(report_rows, report_path)
@@ -118,10 +108,10 @@ def main() -> None:
     total_images = sum(r["Images Downloaded"] for r in report_rows)
 
     print(f"\n🎉  Done in {elapsed:.1f}s")
-    print(f"    Pages processed : {len(report_rows)}")
-    print(f"    Images saved    : {total_images}")
-    print(f"    Report          : {report_path}")
-    print(f"    Output folder   : {output_root.resolve()}\n")
+    print(f"    Products processed : {len(report_rows)}")
+    print(f"    Images saved       : {total_images}")
+    print(f"    Report             : {report_path}")
+    print(f"    Output folder      : {output_root.resolve()}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -129,16 +119,10 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 
 def _write_csv_report(rows: list[dict], path: Path) -> None:
-    """
-    Write the download summary to a CSV file at *path*.
-
-    Args:
-        rows: List of ``{"Book Name": str, "Images Downloaded": int}`` dicts.
-        path: Destination file path.
-    """
+    """Write the download summary to a CSV file at *path*."""
     try:
         with path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["Book Name", "Images Downloaded"])
+            writer = csv.DictWriter(f, fieldnames=["Product Name", "Images Downloaded"])
             writer.writeheader()
             writer.writerows(rows)
         logger.info("CSV report written: %s", path)
